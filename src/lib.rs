@@ -96,10 +96,72 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 Ok(dict)
             }
 
-            /// Create from Python dict
+            /// Create from Python dict (or from an existing instance)
             #[classmethod]
             pub fn from_dict(_cls: &pyo3::Bound<'_, pyo3::types::PyType>, obj: &pyo3::Bound<'_, pyo3::prelude::PyAny>) -> pyo3::prelude::PyResult<Self> {
-                let slf = pythonize::depythonize(obj)?;
+                use pyo3::prelude::*;
+
+                // If the input is already an instance of Self, just clone it
+                if let Ok(slf) = obj.extract::<Self>() {
+                    return Ok(slf);
+                }
+
+                // Normalize datetime objects to ISO strings recursively
+                fn normalize_datetimes<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+                    let datetime_mod = py.import("datetime")?;
+                    let datetime_cls = datetime_mod.getattr("datetime")?;
+
+                    // Check if it's a datetime object
+                    if obj.is_instance(&datetime_cls)? {
+                        let iso_str = obj.call_method0("isoformat")?;
+                        return Ok(iso_str);
+                    }
+
+                    // Check if it's a dict - recursively normalize values
+                    if let Ok(dict) = obj.cast::<pyo3::types::PyDict>() {
+                        let new_dict = pyo3::types::PyDict::new(py);
+                        for (key, value) in dict.iter() {
+                            let normalized_value = normalize_datetimes(py, &value)?;
+                            new_dict.set_item(key, normalized_value)?;
+                        }
+                        return Ok(new_dict.clone().into_any());
+                    }
+
+                    // Check if it's a list - recursively normalize elements
+                    if let Ok(list) = obj.cast::<pyo3::types::PyList>() {
+                        let new_list = pyo3::types::PyList::empty(py);
+                        for item in list.iter() {
+                            let normalized_item = normalize_datetimes(py, &item)?;
+                            new_list.append(normalized_item)?;
+                        }
+                        return Ok(new_list.into_any());
+                    }
+
+                    // Return as-is for other types
+                    Ok(obj.clone())
+                }
+
+                let py = obj.py();
+                let normalized = normalize_datetimes(py, obj)?;
+
+                // Otherwise, try to deserialize from a dict
+                use pythonize::{Depythonizer, PythonizeError};
+                use serde::Deserialize;
+
+                fn depythonize_with_path<'py, T>(obj: &Bound<'py, PyAny>) -> ::std::result::Result<T, serde_path_to_error::Error<PythonizeError>>
+                    where
+                        T: Deserialize<'py>,
+                    {
+                        let mut deserializer = Depythonizer::from_object(obj);
+                        serde_path_to_error::deserialize(&mut deserializer)
+                    }
+
+                let slf: Self = depythonize_with_path(&normalized).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid structure at `{}`: {}", e.path(), e.inner()
+                ))
+                })?;
+
                 Ok(slf)
             }
 
