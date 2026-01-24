@@ -1,8 +1,65 @@
-// In your proc-macro crate (Cargo.toml needs `proc-macro = true`)
+//! Procedural macros for mimirtypes.
+//!
+//! The `#[mimir_type]` attribute macro generates:
+//! - PyO3 bindings (pyclass, pymethods)
+//! - Serde serialization with camelCase aliases
+//! - TypeScript exports via ts-rs
+//! - Automatic module registration via linkme
+//! - Python stub info for .pyi generation
 
 use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{Data, DeriveInput, Fields, parse_macro_input};
+use syn::{
+    Data, DeriveInput, Field, Fields, Ident, Type, parse_macro_input, punctuated::Punctuated,
+    token::Comma,
+};
+
+// ============================================================================
+// Main macro
+// ============================================================================
+
+/// Attribute macro that transforms a struct into a full mimir type with:
+/// - PyO3 Python bindings
+/// - Serde serialization with camelCase aliases
+/// - TypeScript type exports
+/// - Automatic module registration
+/// - Stub info for .pyi generation
+#[proc_macro_attribute]
+pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut input = parse_macro_input!(item as DeriveInput);
+    let name = input.ident.clone();
+
+    // add serde aliases for camelCase field names
+    add_serde_aliases(&mut input);
+
+    // extract fields and build params
+    let fields = extract_named_fields(&input);
+    let (params, field_names) = build_params_and_field_names(fields);
+    let stub_fields = generate_stub_fields_info(fields);
+    let stub_methods = generate_stub_methods();
+
+    // generate all code blocks
+    let struct_def = generate_struct_definition(&input, &name);
+    let type_behavior = generate_type_behavior_impl(&name);
+    let pymethods = generate_pymethods_impl(&name, &params, &field_names);
+    let rust_impl = generate_rust_impl(&name, &params, &field_names);
+    let registration = generate_registration(&name, &stub_fields, &stub_methods);
+
+    let expanded = quote! {
+        #struct_def
+        #type_behavior
+        #pymethods
+        #rust_impl
+        #registration
+    };
+
+    expanded.into()
+}
+
+// ============================================================================
+// String utilities
+// ============================================================================
 
 /// Convert a snake_case string to camelCase
 fn snake_to_camel(s: &str) -> String {
@@ -22,22 +79,114 @@ fn snake_to_camel(s: &str) -> String {
     result
 }
 
-#[proc_macro_attribute]
-pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let mut input = parse_macro_input!(item as DeriveInput);
-    let name = &input.ident;
+// ============================================================================
+// Type conversion: Rust -> Python type hints
+// ============================================================================
 
-    // Generate a unique identifier for the static registration
-    let registration_ident = format_ident!("__MIMIR_TYPE_REG_{}", name);
+/// Convert a Rust type to a Python type hint string for stub generation.
+fn rust_type_to_python_hint(ty: &Type) -> String {
+    let type_str = quote!(#ty).to_string();
+    convert_type_string(&type_str)
+}
 
-    // Add serde alias attributes to each field for camelCase deserialization
+/// Convert a stringified Rust type to Python type hint.
+fn convert_type_string(s: &str) -> String {
+    let s = s.trim();
+
+    // Option<T> -> T | None
+    if s.starts_with("Option <") || s.starts_with("Option<") {
+        let inner = extract_generic_arg(s, "Option");
+        return format!("{} | None", convert_type_string(&inner));
+    }
+
+    // Vec<T> -> list[T]
+    if s.starts_with("Vec <") || s.starts_with("Vec<") {
+        let inner = extract_generic_arg(s, "Vec");
+        return format!("list[{}]", convert_type_string(&inner));
+    }
+
+    // HashMap<K, V> -> dict[K, V]
+    if s.starts_with("HashMap <") || s.starts_with("HashMap<") {
+        let inner = extract_generic_arg(s, "HashMap");
+        let parts: Vec<&str> = split_generic_args(&inner);
+        if parts.len() == 2 {
+            return format!(
+                "dict[{}, {}]",
+                convert_type_string(parts[0]),
+                convert_type_string(parts[1])
+            );
+        }
+    }
+
+    // handle (most/all?) common primitive types
+    match s {
+        "String" | "& str" | "&str" => "str".to_string(),
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => "int".to_string(),
+        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => "int".to_string(),
+        "f32" | "f64" => "float".to_string(),
+        "bool" => "bool".to_string(),
+        "()" => "None".to_string(),
+        _ => {
+            // Handle chrono types
+            if s.contains("DateTime") {
+                return "datetime".to_string();
+            }
+            if s.contains("NaiveDate") {
+                return "date".to_string();
+            }
+            // Handle jiff types
+            if s.contains("Timestamp") || s.contains("Zoned") {
+                return "datetime".to_string();
+            }
+            // default: use the type name as-is (for custom types)
+            // extract just the type name without module path
+            s.split("::").last().unwrap_or(s).trim().to_string()
+        }
+    }
+}
+
+/// Extract the generic argument from a type like "Option < T >" or "Vec<T>"
+fn extract_generic_arg(s: &str, wrapper: &str) -> String {
+    let start = s.find('<').unwrap_or(wrapper.len()) + 1;
+    let end = s.rfind('>').unwrap_or(s.len());
+    s[start..end].trim().to_string()
+}
+
+/// Split generic arguments respecting nested generics.
+/// "K, V" -> ["K", "V"]
+/// "String, Vec<i32>" -> ["String", "Vec<i32>"]
+fn split_generic_args(s: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut depth = 0;
+    let mut start = 0;
+
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                result.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    result.push(s[start..].trim());
+    result
+}
+
+// ============================================================================
+// Field processing
+// ============================================================================
+
+/// Add serde alias attributes for camelCase deserialization to struct fields.
+fn add_serde_aliases(input: &mut DeriveInput) {
     if let Data::Struct(ref mut data) = input.data
         && let Fields::Named(ref mut fields) = data.fields
     {
         for field in fields.named.iter_mut() {
             if let Some(ident) = &field.ident {
                 let camel_case_name = snake_to_camel(&ident.to_string());
-                // Only add alias if camelCase differs from snake_case
                 #[allow(clippy::cmp_owned)]
                 if camel_case_name != ident.to_string() {
                     let alias_attr: syn::Attribute = syn::parse_quote! {
@@ -48,17 +197,23 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     }
+}
 
-    // Extract named fields (after mutation)
-    let fields = match &input.data {
+/// Extract named fields from a struct, panicking if not a struct with named fields.
+fn extract_named_fields(input: &DeriveInput) -> &Punctuated<Field, Comma> {
+    match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) => &fields.named,
             _ => panic!("mimir_type only supports structs with named fields"),
         },
         _ => panic!("mimir_type only supports structs"),
-    };
+    }
+}
 
-    // Build function parameters: `bar: i64, fizz: String`
+/// Build function parameters and field names from fields.
+fn build_params_and_field_names(
+    fields: &Punctuated<Field, Comma>,
+) -> (Vec<TokenStream2>, Vec<&Option<Ident>>) {
     let params = fields
         .iter()
         .map(|f| {
@@ -66,145 +221,226 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let ty = &f.ty;
             quote! { #name: #ty }
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    // Build struct init: `bar, fizz`
-    let field_names = fields.iter().map(|f| &f.ident).collect::<Vec<_>>();
+    let field_names = fields.iter().map(|f| &f.ident).collect();
 
-    let expanded = quote! {
+    (params, field_names)
+}
 
+/// Generate stub info string for a struct's fields.
+/// Format: "field_name:python_type;field_name2:python_type2"
+fn generate_stub_fields_info(fields: &Punctuated<Field, Comma>) -> String {
+    fields
+        .iter()
+        .filter_map(|f| {
+            f.ident.as_ref().map(|name| {
+                let py_type = rust_type_to_python_hint(&f.ty);
+                format!("{}:{}", name, py_type)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
 
+// ============================================================================
+// Code generation
+// ============================================================================
+
+/// Generate the struct definition with all necessary derive macros and attributes.
+fn generate_struct_definition(input: &DeriveInput, name: &Ident) -> TokenStream2 {
+    quote! {
         #[cfg_attr(feature = "pyo3", pyo3::pyclass(get_all))]
         #[derive(ts_rs::TS, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
         #[ts(export, export_to = format!("{}/{}.ts", module_path!().replace("::", "/"), stringify!(#name)))]
-        #input  // Re-emit the original struct (now with serde aliases)
+        #input
+    }
+}
 
-
+/// Generate the TypeBehavior trait implementation.
+fn generate_type_behavior_impl(name: &Ident) -> TokenStream2 {
+    quote! {
         impl crate::TypeBehavior for #name {}
+    }
+}
 
-        // Python methods
+// ============================================================================
+// Common PyO3 methods - Single source of truth for impl AND stubs
+// ============================================================================
+
+/// Definition of a common method available on all mimir types.
+/// Each method defines both its Rust implementation and Python stub signature.
+struct CommonMethod {
+    /// Python stub signature (e.g., "def to_dict(self) -> dict[str, Any]: ...")
+    stub: &'static str,
+    /// Function that generates the Rust implementation tokens
+    impl_tokens: fn() -> TokenStream2,
+}
+
+/// All common methods available on mimir types.
+/// This is the SINGLE SOURCE OF TRUTH - add new methods here and both
+/// the Rust implementation and Python stubs will be generated automatically.
+fn common_methods() -> Vec<CommonMethod> {
+    vec![
+        CommonMethod {
+            stub: "def to_dict(self) -> dict[str, Any]: ...",
+            impl_tokens: || {
+                quote! {
+                    /// Convert to a Python dict
+                    pub fn to_dict<'py>(
+                        &self,
+                        py: pyo3::prelude::Python<'py>
+                    ) -> pyo3::prelude::PyResult<pyo3::prelude::Bound<'py, pyo3::prelude::PyAny>> {
+                        let dict = pythonize::pythonize(py, &self)?;
+                        Ok(dict)
+                    }
+                }
+            },
+        },
+        CommonMethod {
+            stub: "@classmethod\n    def from_dict(cls, obj: dict[str, Any] | Self) -> Self: ...",
+            impl_tokens: || {
+                quote! {
+                    /// Create from Python dict (or from an existing instance)
+                    #[classmethod]
+                    pub fn from_dict(
+                        _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+                        obj: &pyo3::Bound<'_, pyo3::prelude::PyAny>
+                    ) -> pyo3::prelude::PyResult<Self> {
+                        use pyo3::prelude::*;
+
+                        // If the input is already an instance of Self, just clone it
+                        if let Ok(slf) = obj.extract::<Self>() {
+                            return Ok(slf);
+                        }
+
+                        let py = obj.py();
+                        let normalized = crate::pyutil::normalize_datetimes(py, obj)?;
+
+                        let result: Self = crate::pyutil::depythonize_with_path(&normalized)
+                            .map_err(|e| {
+                                pyo3::exceptions::PyValueError::new_err(format!(
+                                    "Invalid structure at `{}`: {}",
+                                    e.path(),
+                                    e.inner()
+                                ))
+                            })?;
+
+                        Ok(result)
+                    }
+                }
+            },
+        },
+        CommonMethod {
+            stub: "def to_json(self) -> str: ...",
+            impl_tokens: || {
+                quote! {
+                    /// Convert to JSON string
+                    pub fn to_json(&self) -> pyo3::prelude::PyResult<String> {
+                        let json = crate::TypeBehavior::to_json(self)
+                            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                        Ok(json)
+                    }
+                }
+            },
+        },
+        CommonMethod {
+            stub: "@classmethod\n    def from_json(cls, json: str) -> Self: ...",
+            impl_tokens: || {
+                quote! {
+                    /// Create from JSON string
+                    #[classmethod]
+                    pub fn from_json(
+                        _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+                        json: &str
+                    ) -> pyo3::prelude::PyResult<Self> {
+                        <Self as crate::TypeBehavior>::from_json(json.to_owned())
+                            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+                    }
+                }
+            },
+        },
+        CommonMethod {
+            stub: "def __eq__(self, other: Self) -> bool: ...",
+            impl_tokens: || {
+                quote! {
+                    /// Compare to another instance
+                    pub fn __eq__(&self, other: &Self) -> bool {
+                        self == other
+                    }
+                }
+            },
+        },
+        CommonMethod {
+            stub: "def __str__(self) -> str: ...",
+            impl_tokens: || {
+                quote! {
+                    /// Debug representation
+                    pub fn __str__(&self) -> String {
+                        format!("{:?}", self)
+                    }
+                }
+            },
+        },
+    ]
+}
+
+/// Generate the combined stub methods string from all common methods.
+fn generate_stub_methods() -> String {
+    common_methods()
+        .iter()
+        .map(|m| format!("    {}", m.stub))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Generate the PyO3 pymethods implementation block.
+fn generate_pymethods_impl(
+    name: &Ident,
+    params: &[TokenStream2],
+    field_names: &[&Option<Ident>],
+) -> TokenStream2 {
+    // generate tokens for all common methods
+    let method_impls: Vec<TokenStream2> =
+        common_methods().iter().map(|m| (m.impl_tokens)()).collect();
+
+    // also add the default init method
+    quote! {
         #[cfg(feature = "pyo3")]
         #[pyo3::pymethods]
         impl #name {
             #[new]
             #[allow(clippy::too_many_arguments)]
             pub fn __init__(#(#params),*) -> Self {
-                Self {
-                    #(#field_names),*
-                }
+                Self { #(#field_names),* }
             }
 
-            /// Convert to a Python dict
-            pub fn to_dict<'py>(&self, py: pyo3::prelude::Python<'py>) -> pyo3::prelude::PyResult<pyo3::prelude::Bound<'py, pyo3::prelude::PyAny>> {
-                let dict = pythonize::pythonize(py, &self)?;
-                Ok(dict)
-            }
-
-            /// Create from Python dict (or from an existing instance)
-            #[classmethod]
-            pub fn from_dict(_cls: &pyo3::Bound<'_, pyo3::types::PyType>, obj: &pyo3::Bound<'_, pyo3::prelude::PyAny>) -> pyo3::prelude::PyResult<Self> {
-                use pyo3::prelude::*;
-
-                // If the input is already an instance of Self, just clone it
-                if let Ok(slf) = obj.extract::<Self>() {
-                    return Ok(slf);
-                }
-
-                // Normalize datetime objects to ISO strings recursively
-                fn normalize_datetimes<'py>(py: Python<'py>, obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-                    let datetime_mod = py.import("datetime")?;
-                    let datetime_cls = datetime_mod.getattr("datetime")?;
-
-                    // Check if it's a datetime object
-                    if obj.is_instance(&datetime_cls)? {
-                        let iso_str = obj.call_method0("isoformat")?;
-                        return Ok(iso_str);
-                    }
-
-                    // Check if it's a dict - recursively normalize values
-                    if let Ok(dict) = obj.cast::<pyo3::types::PyDict>() {
-                        let new_dict = pyo3::types::PyDict::new(py);
-                        for (key, value) in dict.iter() {
-                            let normalized_value = normalize_datetimes(py, &value)?;
-                            new_dict.set_item(key, normalized_value)?;
-                        }
-                        return Ok(new_dict.clone().into_any());
-                    }
-
-                    // Check if it's a list - recursively normalize elements
-                    if let Ok(list) = obj.cast::<pyo3::types::PyList>() {
-                        let new_list = pyo3::types::PyList::empty(py);
-                        for item in list.iter() {
-                            let normalized_item = normalize_datetimes(py, &item)?;
-                            new_list.append(normalized_item)?;
-                        }
-                        return Ok(new_list.into_any());
-                    }
-
-                    // Return as-is for other types
-                    Ok(obj.clone())
-                }
-
-                let py = obj.py();
-                let normalized = normalize_datetimes(py, obj)?;
-
-                // Otherwise, try to deserialize from a dict
-                use pythonize::{Depythonizer, PythonizeError};
-                use serde::Deserialize;
-
-                fn depythonize_with_path<'py, T>(obj: &Bound<'py, PyAny>) -> ::std::result::Result<T, serde_path_to_error::Error<PythonizeError>>
-                    where
-                        T: Deserialize<'py>,
-                    {
-                        let mut deserializer = Depythonizer::from_object(obj);
-                        serde_path_to_error::deserialize(&mut deserializer)
-                    }
-
-                let slf: Self = depythonize_with_path(&normalized).map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                    "Invalid structure at `{}`: {}", e.path(), e.inner()
-                ))
-                })?;
-
-                Ok(slf)
-            }
-
-            /// Convert to JSON string
-            pub fn to_json(&self) -> pyo3::prelude::PyResult<String> {
-                let json = crate::TypeBehavior::to_json(self)
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                Ok(json)
-            }
-
-            /// Create from JSON string
-            #[classmethod]
-            pub fn from_json(_cls: &pyo3::Bound<'_, pyo3::types::PyType>, json: &str) -> pyo3::prelude::PyResult<Self> {
-                <Self as crate::TypeBehavior>::from_json(json.to_owned())
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-            }
-
-            /// Compare to another instance
-            pub fn __eq__(&self, other: &Self) -> bool {
-                self == other
-            }
-
-            /// Debug visual of object
-            pub fn __str__(&self) -> String {
-                format!("{:?}", self)
-            }
+            #(#method_impls)*
         }
+    }
+}
 
-        // Another for Rust interface Self::new
+/// Generate the Rust-facing impl block with new() constructor.
+fn generate_rust_impl(
+    name: &Ident,
+    params: &[TokenStream2],
+    field_names: &[&Option<Ident>],
+) -> TokenStream2 {
+    quote! {
         impl #name {
             #[allow(clippy::too_many_arguments)]
             pub fn new(#(#params),*) -> Self {
-                Self {
-                    #(#field_names),*
-                }
+                Self { #(#field_names),* }
             }
         }
+    }
+}
 
-        // Auto-registration for PyO3 module building
+/// Generate the linkme registration for automatic PyO3 module building.
+fn generate_registration(name: &Ident, stub_fields: &str, stub_methods: &str) -> TokenStream2 {
+    let registration_ident = format_ident!("__MIMIR_TYPE_REG_{}", name);
+
+    quote! {
         #[cfg(feature = "pyo3")]
         #[allow(non_upper_case_globals)]
         #[linkme::distributed_slice(crate::MIMIR_TYPES)]
@@ -212,13 +448,12 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
         static #registration_ident: crate::MimirTypeEntry = crate::MimirTypeEntry {
             rust_module_path: module_path!(),
             type_name: stringify!(#name),
+            stub_fields: #stub_fields,
+            stub_methods: #stub_methods,
             register: |m: &pyo3::Bound<'_, pyo3::types::PyModule>| -> pyo3::PyResult<()> {
                 use pyo3::types::PyModuleMethods;
                 m.add_class::<#name>()
             },
         };
-
-    };
-
-    expanded.into()
+    }
 }
