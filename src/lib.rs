@@ -1,7 +1,7 @@
 // In your proc-macro crate (Cargo.toml needs `proc-macro = true`)
 
 use proc_macro::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
 /// Convert a snake_case string to camelCase
@@ -26,6 +26,9 @@ fn snake_to_camel(s: &str) -> String {
 pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
+
+    // Generate a unique identifier for the static registration
+    let registration_ident = format_ident!("__MIMIR_TYPE_REG_{}", name);
 
     // Add serde alias attributes to each field for camelCase deserialization
     if let Data::Struct(ref mut data) = input.data
@@ -71,7 +74,7 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
 
 
-        #[pyo3::pyclass(get_all)]
+        #[cfg_attr(feature = "pyo3", pyo3::pyclass(get_all))]
         #[derive(ts_rs::TS, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
         #[ts(export, export_to = format!("{}/{}.ts", module_path!().replace("::", "/"), stringify!(#name)))]
         #input  // Re-emit the original struct (now with serde aliases)
@@ -80,6 +83,7 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
         impl crate::TypeBehavior for #name {}
 
         // Python methods
+        #[cfg(feature = "pyo3")]
         #[pyo3::pymethods]
         impl #name {
             #[new]
@@ -199,6 +203,20 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         }
+
+        // Auto-registration for PyO3 module building
+        #[cfg(feature = "pyo3")]
+        #[allow(non_upper_case_globals)]
+        #[linkme::distributed_slice(crate::MIMIR_TYPES)]
+        #[linkme(crate = linkme)]
+        static #registration_ident: crate::MimirTypeEntry = crate::MimirTypeEntry {
+            rust_module_path: module_path!(),
+            type_name: stringify!(#name),
+            register: |m: &pyo3::Bound<'_, pyo3::types::PyModule>| -> pyo3::PyResult<()> {
+                use pyo3::types::PyModuleMethods;
+                m.add_class::<#name>()
+            },
+        };
 
     };
 
