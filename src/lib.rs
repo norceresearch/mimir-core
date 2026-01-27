@@ -1,18 +1,30 @@
 //! Procedural macros for mimirtypes.
 //!
-//! The `#[mimir_type]` attribute macro generates:
+//! ## `#[mimir_type]`
+//!
+//! Attribute macro for structs that generates:
 //! - PyO3 bindings (pyclass, pymethods)
 //! - Serde serialization with camelCase aliases
 //! - TypeScript exports via ts-rs
 //! - Automatic module registration via linkme
 //! - Python stub info for .pyi generation
+//!
+//! ## `#[mimir_function]`
+//!
+//! Attribute macro for functions that generates:
+//! - PyO3 pyfunction binding
+//! - Automatic module registration via linkme
+//! - Python stub info for .pyi generation
+//!
+//! Supports both sync and async functions. Async functions are automatically
+//! wrapped with a tokio runtime for Python callers.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Field, Fields, Ident, Type, parse_macro_input, punctuated::Punctuated,
-    token::Comma,
+    Data, DeriveInput, Field, Fields, FnArg, Ident, ItemFn, Pat, ReturnType, Type, parse_macro_input,
+    punctuated::Punctuated, token::Comma,
 };
 
 // ============================================================================
@@ -55,6 +67,163 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+// ============================================================================
+// mimir_function macro
+// ============================================================================
+
+/// Attribute macro that transforms a function into a Python-exposed function with:
+/// - PyO3 pyfunction binding
+/// - Automatic module registration
+/// - Stub info for .pyi generation
+///
+/// # Example
+///
+/// ```ignore
+/// #[mimir_function]
+/// pub fn foo(fizz: String, buzz: Option<usize>) -> Vec<Bar> {
+///     // implementation
+/// }
+/// ```
+///
+/// This generates a `#[pyfunction]` that can be called from Python and
+/// automatically registers it in the appropriate module based on its Rust path.
+#[proc_macro_attribute]
+pub fn mimir_function(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemFn);
+    let fn_name = &input.sig.ident;
+    let fn_vis = &input.vis;
+    let fn_block = &input.block;
+    let fn_attrs = &input.attrs;
+    let fn_generics = &input.sig.generics;
+    let fn_output = &input.sig.output;
+    let fn_asyncness = &input.sig.asyncness;
+
+    // extract parameters
+    let params: Vec<_> = input
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(pat_type) = arg {
+                Some(pat_type)
+            } else {
+                None // skip self parameters
+            }
+        })
+        .collect();
+
+    // build parameter tokens for the function sig
+    let param_tokens: Vec<TokenStream2> = params
+        .iter()
+        .map(|p| {
+            let pat = &p.pat;
+            let ty = &p.ty;
+            quote! { #pat: #ty }
+        })
+        .collect();
+
+    let stub_signature = generate_function_stub_signature(fn_name, &params, fn_output);
+    let registration = generate_function_registration(fn_name, &stub_signature);
+
+    // Impl depends on if we need to wrap it with tokio async
+    let fn_impl = if fn_asyncness.is_some() {
+        quote! {
+            #(#fn_attrs)*
+            #[cfg(feature = "pyo3")]
+            #[pyo3::pyfunction]
+            #fn_vis fn #fn_name #fn_generics (#(#param_tokens),*) #fn_output {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime")
+                    .block_on(async #fn_block)
+            }
+
+            #(#fn_attrs)*
+            #[cfg(not(feature = "pyo3"))]
+            #fn_vis async fn #fn_name #fn_generics (#(#param_tokens),*) #fn_output
+                #fn_block
+        }
+    } else {
+        // sync function
+        quote! {
+            #(#fn_attrs)*
+            #[cfg(feature = "pyo3")]
+            #[pyo3::pyfunction]
+            #fn_vis fn #fn_name #fn_generics (#(#param_tokens),*) #fn_output
+                #fn_block
+
+            #(#fn_attrs)*
+            #[cfg(not(feature = "pyo3"))]
+            #fn_vis fn #fn_name #fn_generics (#(#param_tokens),*) #fn_output
+                #fn_block
+        }
+    };
+
+    let expanded = quote! {
+        #fn_impl
+        #registration
+    };
+
+    expanded.into()
+}
+
+/// Generate the Python stub signature for a function.
+/// Returns a string like "def search_ted(query: str, limit: int | None) -> list[Tender]: ..."
+fn generate_function_stub_signature(fn_name: &Ident, params: &[&syn::PatType], return_type: &ReturnType) -> String {
+    let param_stubs: Vec<String> = params
+        .iter()
+        .filter_map(|p| {
+            // Extract parameter name
+            let name = if let Pat::Ident(pat_ident) = p.pat.as_ref() {
+                let n = pat_ident.ident.to_string();
+
+                // Ignore 'pÿ́' specific, if the function takes a reference to Python
+                if &n == "py" {
+                    return None;
+                }
+                n
+            } else {
+                return None;
+            };
+
+            // Convert type to Python hint
+            let py_type = rust_type_to_python_hint(&p.ty);
+            Some(format!("{}: {}", name, py_type))
+        })
+        .collect();
+
+    let return_hint = match return_type {
+        ReturnType::Default => "None".to_string(),
+        ReturnType::Type(_, ty) => rust_type_to_python_hint(ty),
+    };
+
+    format!("def {}({}) -> {}: ...", fn_name, param_stubs.join(", "), return_hint)
+}
+
+/// Generate the linkme registration for a function.
+fn generate_function_registration(fn_name: &Ident, stub_signature: &str) -> TokenStream2 {
+    let registration_ident = format_ident!("__MIMIR_FUNC_REG_{}", fn_name);
+    let fn_name_str = fn_name.to_string();
+
+    quote! {
+        #[cfg(feature = "pyo3")]
+        #[allow(non_upper_case_globals)]
+        #[linkme::distributed_slice(crate::MIMIR_FUNCTIONS)]
+        #[linkme(crate = linkme)]
+        static #registration_ident: crate::MimirFunctionEntry = crate::MimirFunctionEntry {
+            rust_module_path: module_path!(),
+            function_name: #fn_name_str,
+            stub_signature: #stub_signature,
+            register: |m: &pyo3::Bound<'_, pyo3::types::PyModule>| -> pyo3::PyResult<()> {
+                use pyo3::types::PyModuleMethods;
+                use pyo3::wrap_pyfunction;
+                m.add_function(wrap_pyfunction!(#fn_name, m)?)
+            },
+        };
+    }
 }
 
 // ============================================================================
@@ -211,9 +380,7 @@ fn extract_named_fields(input: &DeriveInput) -> &Punctuated<Field, Comma> {
 }
 
 /// Build function parameters and field names from fields.
-fn build_params_and_field_names(
-    fields: &Punctuated<Field, Comma>,
-) -> (Vec<TokenStream2>, Vec<&Option<Ident>>) {
+fn build_params_and_field_names(fields: &Punctuated<Field, Comma>) -> (Vec<TokenStream2>, Vec<&Option<Ident>>) {
     let params = fields
         .iter()
         .map(|f| {
@@ -395,14 +562,9 @@ fn generate_stub_methods() -> String {
 }
 
 /// Generate the PyO3 pymethods implementation block.
-fn generate_pymethods_impl(
-    name: &Ident,
-    params: &[TokenStream2],
-    field_names: &[&Option<Ident>],
-) -> TokenStream2 {
+fn generate_pymethods_impl(name: &Ident, params: &[TokenStream2], field_names: &[&Option<Ident>]) -> TokenStream2 {
     // generate tokens for all common methods
-    let method_impls: Vec<TokenStream2> =
-        common_methods().iter().map(|m| (m.impl_tokens)()).collect();
+    let method_impls: Vec<TokenStream2> = common_methods().iter().map(|m| (m.impl_tokens)()).collect();
 
     // also add the default init method
     quote! {
@@ -421,11 +583,7 @@ fn generate_pymethods_impl(
 }
 
 /// Generate the Rust-facing impl block with new() constructor.
-fn generate_rust_impl(
-    name: &Ident,
-    params: &[TokenStream2],
-    field_names: &[&Option<Ident>],
-) -> TokenStream2 {
+fn generate_rust_impl(name: &Ident, params: &[TokenStream2], field_names: &[&Option<Ident>]) -> TokenStream2 {
     quote! {
         impl #name {
             #[allow(clippy::too_many_arguments)]
