@@ -50,12 +50,13 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let (params, field_names) = build_params_and_field_names(fields);
     let stub_fields = generate_stub_fields_info(fields);
     let stub_methods = generate_stub_methods();
+    let arrow_fields = generate_arrow_fields(fields);
 
     // generate all code blocks
     let struct_def = generate_struct_definition(&input, &name);
     let type_behavior = generate_type_behavior_impl(&name);
-    let pymethods = generate_pymethods_impl(&name, &params, &field_names);
-    let rust_impl = generate_rust_impl(&name, &params, &field_names);
+    let pymethods = generate_pymethods_impl(&name, &params, &field_names, &arrow_fields);
+    let rust_impl = generate_rust_impl(&name, &params, &field_names, &arrow_fields);
     let registration = generate_registration(&name, &stub_fields, &stub_methods);
 
     let expanded = quote! {
@@ -345,6 +346,134 @@ fn split_generic_args(s: &str) -> Vec<&str> {
 }
 
 // ============================================================================
+// Type conversion: Rust -> Arrow DataType
+// ============================================================================
+
+/// Convert a Rust type to Arrow DataType tokens for schema generation.
+/// Returns (datatype_tokens, nullable) where nullable indicates if the type is Option<T>.
+fn rust_type_to_arrow_datatype(ty: &Type) -> (TokenStream2, bool) {
+    let type_str = quote!(#ty).to_string();
+    convert_to_arrow_datatype(&type_str)
+}
+
+/// Convert a stringified Rust type to Arrow DataType tokens.
+/// Returns (datatype_tokens, nullable).
+fn convert_to_arrow_datatype(s: &str) -> (TokenStream2, bool) {
+    convert_to_arrow_datatype_inner(s, false)
+}
+
+/// Inner conversion function that tracks whether we're inside an Option context.
+/// When inside_option is true, nested struct fields should be made nullable.
+fn convert_to_arrow_datatype_inner(s: &str, inside_option: bool) -> (TokenStream2, bool) {
+    let s = s.trim();
+
+    // Option<T> -> inner type with nullable=true, and mark that we're inside an Option
+    if s.starts_with("Option <") || s.starts_with("Option<") {
+        let inner = extract_generic_arg(s, "Option");
+        let (inner_tokens, _) = convert_to_arrow_datatype_inner(&inner, true);
+        return (inner_tokens, true);
+    }
+
+    // Vec<T> -> List(T)
+    if s.starts_with("Vec <") || s.starts_with("Vec<") {
+        let inner = extract_generic_arg(s, "Vec");
+        let (inner_tokens, inner_nullable) = convert_to_arrow_datatype_inner(&inner, inside_option);
+        return (
+            quote! {
+                arrow_schema::DataType::List(
+                    std::sync::Arc::new(arrow_schema::Field::new("item", #inner_tokens, #inner_nullable))
+                )
+            },
+            false,
+        );
+    }
+
+    // HashMap<K, V> -> Map(K, V)
+    if s.starts_with("HashMap <") || s.starts_with("HashMap<") {
+        let inner = extract_generic_arg(s, "HashMap");
+        let parts: Vec<&str> = split_generic_args(&inner);
+        if parts.len() == 2 {
+            let (key_tokens, _) = convert_to_arrow_datatype_inner(parts[0], inside_option);
+            let (value_tokens, value_nullable) = convert_to_arrow_datatype_inner(parts[1], inside_option);
+            return (
+                quote! {
+                    arrow_schema::DataType::Map(
+                        std::sync::Arc::new(arrow_schema::Field::new(
+                            "entries",
+                            arrow_schema::DataType::Struct(
+                                arrow_schema::Fields::from(vec![
+                                    arrow_schema::Field::new("key", #key_tokens, false),
+                                    arrow_schema::Field::new("value", #value_tokens, #value_nullable),
+                                ])
+                            ),
+                            false
+                        )),
+                        false // keys_sorted
+                    )
+                },
+                false,
+            );
+        }
+    }
+
+    // Primitive types
+    // Note: We use LargeUtf8 to match Polars' default string representation
+    let tokens = match s {
+        "String" | "& str" | "&str" => quote! { arrow_schema::DataType::LargeUtf8 },
+        "i8" => quote! { arrow_schema::DataType::Int8 },
+        "i16" => quote! { arrow_schema::DataType::Int16 },
+        "i32" => quote! { arrow_schema::DataType::Int32 },
+        "i64" | "isize" => quote! { arrow_schema::DataType::Int64 },
+        "i128" => quote! { arrow_schema::DataType::Decimal128(38, 0) },
+        "u8" => quote! { arrow_schema::DataType::UInt8 },
+        "u16" => quote! { arrow_schema::DataType::UInt16 },
+        "u32" => quote! { arrow_schema::DataType::UInt32 },
+        "u64" | "usize" => quote! { arrow_schema::DataType::UInt64 },
+        "f32" => quote! { arrow_schema::DataType::Float32 },
+        "f64" => quote! { arrow_schema::DataType::Float64 },
+        "bool" => quote! { arrow_schema::DataType::Boolean },
+        "()" => quote! { arrow_schema::DataType::Null },
+        _ => {
+            // Handle chrono/jiff datetime types
+            if s.contains("DateTime") || s.contains("Timestamp") || s.contains("Zoned") {
+                quote! { arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())) }
+            } else if s.contains("NaiveDate") {
+                quote! { arrow_schema::DataType::Date32 }
+            } else {
+                // For nested mimir types, call their get_arrow_schema() to build a Struct type
+                // Extract just the type name (without module path)
+                let type_name = s.split("::").last().unwrap_or(s).trim();
+                let type_ident = format_ident!("{}", type_name);
+
+                // When inside an Option, make all nested struct fields nullable
+                // because when the Option is None, all inner fields will be null
+                if inside_option {
+                    quote! {
+                        arrow_schema::DataType::Struct(
+                            arrow_schema::Fields::from(
+                                #type_ident::get_arrow_schema()
+                                    .fields()
+                                    .iter()
+                                    .map(|f| arrow_schema::Field::new(f.name(), f.data_type().clone(), true))
+                                    .collect::<Vec<_>>()
+                            )
+                        )
+                    }
+                } else {
+                    quote! {
+                        arrow_schema::DataType::Struct(
+                            #type_ident::get_arrow_schema().fields().clone()
+                        )
+                    }
+                }
+            }
+        }
+    };
+
+    (tokens, false)
+}
+
+// ============================================================================
 // Field processing
 // ============================================================================
 
@@ -408,6 +537,22 @@ fn generate_stub_fields_info(fields: &Punctuated<Field, Comma>) -> String {
         })
         .collect::<Vec<_>>()
         .join(";")
+}
+
+/// Generate Arrow field construction tokens for a struct's fields.
+fn generate_arrow_fields(fields: &Punctuated<Field, Comma>) -> Vec<TokenStream2> {
+    fields
+        .iter()
+        .filter_map(|f| {
+            f.ident.as_ref().map(|name| {
+                let name_str = name.to_string();
+                let (datatype_tokens, nullable) = rust_type_to_arrow_datatype(&f.ty);
+                quote! {
+                    arrow_schema::Field::new(#name_str, #datatype_tokens, #nullable)
+                }
+            })
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -554,15 +699,28 @@ fn common_methods() -> Vec<CommonMethod> {
 
 /// Generate the combined stub methods string from all common methods.
 fn generate_stub_methods() -> String {
-    common_methods()
+    let common_stubs: Vec<String> = common_methods()
         .iter()
         .map(|m| format!("    {}", m.stub))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+
+    // Add arrow schema and record batch stubs
+    let arrow_stubs = vec![
+        "    @classmethod\n    def arrow_schema(cls) -> \"pyarrow.Schema\": ...".to_string(),
+        "    @classmethod\n    def to_record_batch(cls, items: list[Self]) -> \"pyarrow.RecordBatch\": ...".to_string(),
+        "    @classmethod\n    def from_record_batch(cls, batch: \"pyarrow.RecordBatch\") -> list[Self]: ...".to_string(),
+    ];
+
+    [common_stubs, arrow_stubs].concat().join("\n")
 }
 
 /// Generate the PyO3 pymethods implementation block.
-fn generate_pymethods_impl(name: &Ident, params: &[TokenStream2], field_names: &[&Option<Ident>]) -> TokenStream2 {
+fn generate_pymethods_impl(
+    name: &Ident,
+    params: &[TokenStream2],
+    field_names: &[&Option<Ident>],
+    _arrow_fields: &[TokenStream2],
+) -> TokenStream2 {
     // generate tokens for all common methods
     let method_impls: Vec<TokenStream2> = common_methods().iter().map(|m| (m.impl_tokens)()).collect();
 
@@ -578,17 +736,69 @@ fn generate_pymethods_impl(name: &Ident, params: &[TokenStream2], field_names: &
             }
 
             #(#method_impls)*
+
+            #[classmethod]
+            pub fn arrow_schema<'py>(
+                _cls: &pyo3::Bound<'py, pyo3::types::PyType>,
+                py: pyo3::prelude::Python<'py>,
+            ) -> pyo3::prelude::PyResult<pyo3::prelude::Bound<'py, pyo3::prelude::PyAny>> {
+                let schema = Self::get_arrow_schema();
+                ::pyo3_arrow::PySchema::new(std::sync::Arc::new(schema)).into_pyarrow(py)
+            }
+
+            #[classmethod]
+            pub fn to_record_batch<'py>(
+                _cls: &pyo3::Bound<'py, pyo3::types::PyType>,
+                py: pyo3::prelude::Python<'py>,
+                items: Vec<Self>,
+            ) -> pyo3::prelude::PyResult<pyo3::prelude::Bound<'py, pyo3::prelude::PyAny>> {
+                let fields: Vec<std::sync::Arc<arrow_schema::Field>> = Self::get_arrow_schema()
+                    .fields()
+                    .iter()
+                    .cloned()
+                    .collect();
+
+                let batch = serde_arrow::to_record_batch(&fields, &items)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+                ::pyo3_arrow::PyRecordBatch::new(batch).into_pyarrow(py)
+            }
+
+            #[classmethod]
+            pub fn from_record_batch(
+                _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+                batch: ::pyo3_arrow::PyRecordBatch,
+            ) -> pyo3::prelude::PyResult<Vec<Self>> {
+                serde_arrow::from_record_batch(&batch.into_inner())
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+            }
         }
     }
 }
 
 /// Generate the Rust-facing impl block with new() constructor.
-fn generate_rust_impl(name: &Ident, params: &[TokenStream2], field_names: &[&Option<Ident>]) -> TokenStream2 {
+fn generate_rust_impl(
+    name: &Ident,
+    params: &[TokenStream2],
+    field_names: &[&Option<Ident>],
+    arrow_fields: &[TokenStream2],
+) -> TokenStream2 {
     quote! {
         impl #name {
             #[allow(clippy::too_many_arguments)]
             pub fn new(#(#params),*) -> Self {
                 Self { #(#field_names),* }
+            }
+        }
+
+        // Arrow schema method - available in both pyo3 and non-pyo3 builds
+        // For pyo3 builds, use the arrow_schema() classmethod instead for Python interop
+        impl #name {
+            /// Get the Arrow schema for this type.
+            pub fn get_arrow_schema() -> arrow_schema::Schema {
+                arrow_schema::Schema::new(vec![
+                    #(#arrow_fields),*
+                ])
             }
         }
     }
