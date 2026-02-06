@@ -231,6 +231,13 @@ fn generate_function_registration(fn_name: &Ident, stub_signature: &str) -> Toke
 // String utilities
 // ============================================================================
 
+/// Strip the `r#` prefix from raw identifiers.
+/// In Rust, `r#type` is used to use reserved keywords as identifiers,
+/// but the prefix should not appear in generated output (Arrow schemas, Python stubs, serde aliases).
+fn strip_raw_prefix(s: &str) -> String {
+    s.strip_prefix("r#").unwrap_or(s).to_string()
+}
+
 /// Convert a snake_case string to camelCase
 fn snake_to_camel(s: &str) -> String {
     let mut result = String::new();
@@ -484,9 +491,10 @@ fn add_serde_aliases(input: &mut DeriveInput) {
     {
         for field in fields.named.iter_mut() {
             if let Some(ident) = &field.ident {
-                let camel_case_name = snake_to_camel(&ident.to_string());
+                let field_name = strip_raw_prefix(&ident.to_string());
+                let camel_case_name = snake_to_camel(&field_name);
                 #[allow(clippy::cmp_owned)]
-                if camel_case_name != ident.to_string() {
+                if camel_case_name != field_name {
                     let alias_attr: syn::Attribute = syn::parse_quote! {
                         #[serde(alias = #camel_case_name)]
                     };
@@ -532,7 +540,7 @@ fn generate_stub_fields_info(fields: &Punctuated<Field, Comma>) -> String {
         .filter_map(|f| {
             f.ident.as_ref().map(|name| {
                 let py_type = rust_type_to_python_hint(&f.ty);
-                format!("{}:{}", name, py_type)
+                format!("{}:{}", strip_raw_prefix(&name.to_string()), py_type)
             })
         })
         .collect::<Vec<_>>()
@@ -545,7 +553,7 @@ fn generate_arrow_fields(fields: &Punctuated<Field, Comma>) -> Vec<TokenStream2>
         .iter()
         .filter_map(|f| {
             f.ident.as_ref().map(|name| {
-                let name_str = name.to_string();
+                let name_str = strip_raw_prefix(&name.to_string());
                 let (datatype_tokens, nullable) = rust_type_to_arrow_datatype(&f.ty);
                 quote! {
                     arrow_schema::Field::new(#name_str, #datatype_tokens, #nullable)
