@@ -55,7 +55,7 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // generate all code blocks
     let struct_def = generate_struct_definition(&input, &name);
     let type_behavior = generate_type_behavior_impl(&name);
-    let pymethods = generate_pymethods_impl(&name, &params, &field_names, &arrow_fields);
+    let pymethods = generate_pymethods_impl(&name, &field_names, &arrow_fields);
     let rust_impl = generate_rust_impl(&name, &params, &field_names, &arrow_fields);
     let registration = generate_registration(&name, &stub_fields, &stub_methods);
 
@@ -725,22 +725,41 @@ fn generate_stub_methods() -> String {
 /// Generate the PyO3 pymethods implementation block.
 fn generate_pymethods_impl(
     name: &Ident,
-    params: &[TokenStream2],
     field_names: &[&Option<Ident>],
     _arrow_fields: &[TokenStream2],
 ) -> TokenStream2 {
     // generate tokens for all common methods
     let method_impls: Vec<TokenStream2> = common_methods().iter().map(|m| (m.impl_tokens)()).collect();
 
-    // also add the default init method
+    // Build __init__ params (all Bound<PyAny>) and dict insertion statements.
+    // __init__ builds a dict and delegates to normalize_datetimes + depythonize,
+    // reusing the same path as from_dict. This handles datetime objects with any
+    // tzinfo (zoneinfo, timezone.utc, etc.) and nested mimir type instances.
+    let init_field_idents: Vec<&Ident> = field_names.iter().map(|n| n.as_ref().unwrap()).collect();
+    let init_field_name_strs: Vec<String> = init_field_idents.iter().map(|id| strip_raw_prefix(&id.to_string())).collect();
+
     quote! {
         #[cfg(feature = "pyo3")]
         #[pyo3::pymethods]
         impl #name {
             #[new]
             #[allow(clippy::too_many_arguments)]
-            pub fn __init__(#(#params),*) -> Self {
-                Self { #(#field_names),* }
+            pub fn __init__(
+                py: pyo3::prelude::Python<'_>,
+                #(#init_field_idents: pyo3::Bound<'_, pyo3::prelude::PyAny>),*
+            ) -> pyo3::prelude::PyResult<Self> {
+                use pyo3::types::PyDictMethods;
+                let dict = pyo3::types::PyDict::new(py);
+                #(dict.set_item(#init_field_name_strs, &#init_field_idents)?;)*
+                let normalized = crate::pyutil::normalize_datetimes(py, &dict.clone().into_any())?;
+                crate::pyutil::depythonize_with_path(&normalized)
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "Invalid structure at `{}`: {}",
+                            e.path(),
+                            e.inner()
+                        ))
+                    })
             }
 
             #(#method_impls)*
