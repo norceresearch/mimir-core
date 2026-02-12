@@ -23,9 +23,60 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Field, Fields, FnArg, Ident, ItemFn, Pat, ReturnType, Type, parse_macro_input,
-    punctuated::Punctuated, token::Comma,
+    Data, DeriveInput, Field, Fields, FnArg, Ident, ItemFn, Lit, Meta, Pat, ReturnType, Type,
+    parse_macro_input, punctuated::Punctuated, token::Comma,
 };
+
+// ============================================================================
+// Attribute parsing
+// ============================================================================
+
+/// Parsed arguments from `#[mimir_type(dbt_model = "name", dbt_source = "table")]`
+struct MimirTypeArgs {
+    dbt_model: Option<String>,
+    dbt_primary_key: Option<String>,
+    dbt_source: Option<String>,
+}
+
+impl MimirTypeArgs {
+    fn parse(attr: TokenStream) -> Self {
+        let mut args = MimirTypeArgs {
+            dbt_model: None,
+            dbt_primary_key: None,
+            dbt_source: None,
+        };
+
+        if attr.is_empty() {
+            return args;
+        }
+
+        let parsed = syn::parse::Parser::parse(
+            Punctuated::<Meta, Comma>::parse_terminated,
+            attr,
+        )
+        .expect("Failed to parse mimir_type attributes");
+
+        for meta in parsed {
+            if let Meta::NameValue(nv) = meta {
+                let key = nv.path.get_ident().map(|i| i.to_string());
+                if let syn::Expr::Lit(syn::ExprLit {
+                    lit: Lit::Str(val), ..
+                }) = &nv.value
+                {
+                    match key.as_deref() {
+                        Some("dbt_model") => args.dbt_model = Some(val.value()),
+                        Some("dbt_primary_key") => args.dbt_primary_key = Some(val.value()),
+                        Some("dbt_source") => args.dbt_source = Some(val.value()),
+                        Some(other) => panic!("Unknown mimir_type attribute: {other}"),
+                        None => {}
+                    }
+                }
+            }
+        }
+
+        args
+    }
+}
 
 // ============================================================================
 // Main macro
@@ -38,7 +89,8 @@ use syn::{
 /// - Automatic module registration
 /// - Stub info for .pyi generation
 #[proc_macro_attribute]
-pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn mimir_type(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args = MimirTypeArgs::parse(attr);
     let mut input = parse_macro_input!(item as DeriveInput);
     let name = input.ident.clone();
 
@@ -57,7 +109,7 @@ pub fn mimir_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let type_behavior = generate_type_behavior_impl(&name);
     let pymethods = generate_pymethods_impl(&name, &field_names, &arrow_fields);
     let rust_impl = generate_rust_impl(&name, &params, &field_names, &arrow_fields);
-    let registration = generate_registration(&name, &stub_fields, &stub_methods);
+    let registration = generate_registration(&name, &stub_fields, &stub_methods, &args);
 
     let expanded = quote! {
         #struct_def
@@ -832,8 +884,21 @@ fn generate_rust_impl(
 }
 
 /// Generate the linkme registration for automatic PyO3 module building.
-fn generate_registration(name: &Ident, stub_fields: &str, stub_methods: &str) -> TokenStream2 {
+fn generate_registration(name: &Ident, stub_fields: &str, stub_methods: &str, args: &MimirTypeArgs) -> TokenStream2 {
     let registration_ident = format_ident!("__MIMIR_TYPE_REG_{}", name);
+
+    let dbt_model_tokens = match &args.dbt_model {
+        Some(model) => quote! { Some(#model) },
+        None => quote! { None },
+    };
+    let dbt_primary_key_tokens = match &args.dbt_primary_key {
+        Some(key) => quote! { Some(#key) },
+        None => quote! { None },
+    };
+    let dbt_source_tokens = match &args.dbt_source {
+        Some(source) => quote! { Some(#source) },
+        None => quote! { None },
+    };
 
     quote! {
         #[cfg(feature = "pyo3")]
@@ -845,6 +910,10 @@ fn generate_registration(name: &Ident, stub_fields: &str, stub_methods: &str) ->
             type_name: stringify!(#name),
             stub_fields: #stub_fields,
             stub_methods: #stub_methods,
+            dbt_model: #dbt_model_tokens,
+            dbt_primary_key: #dbt_primary_key_tokens,
+            dbt_source: #dbt_source_tokens,
+            get_schema: <#name>::get_arrow_schema,
             register: |m: &pyo3::Bound<'_, pyo3::types::PyModule>| -> pyo3::PyResult<()> {
                 use pyo3::types::PyModuleMethods;
                 m.add_class::<#name>()
