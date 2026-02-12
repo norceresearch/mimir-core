@@ -23,8 +23,8 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    Data, DeriveInput, Field, Fields, FnArg, Ident, ItemFn, Lit, Meta, Pat, ReturnType, Type,
-    parse_macro_input, punctuated::Punctuated, token::Comma,
+    Data, DeriveInput, Field, Fields, FnArg, Ident, ItemFn, Lit, Meta, Pat, ReturnType, Type, parse_macro_input,
+    punctuated::Punctuated, token::Comma,
 };
 
 // ============================================================================
@@ -50,19 +50,13 @@ impl MimirTypeArgs {
             return args;
         }
 
-        let parsed = syn::parse::Parser::parse(
-            Punctuated::<Meta, Comma>::parse_terminated,
-            attr,
-        )
-        .expect("Failed to parse mimir_type attributes");
+        let parsed = syn::parse::Parser::parse(Punctuated::<Meta, Comma>::parse_terminated, attr)
+            .expect("Failed to parse mimir_type attributes");
 
         for meta in parsed {
             if let Meta::NameValue(nv) = meta {
                 let key = nv.path.get_ident().map(|i| i.to_string());
-                if let syn::Expr::Lit(syn::ExprLit {
-                    lit: Lit::Str(val), ..
-                }) = &nv.value
-                {
+                if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(val), .. }) = &nv.value {
                     match key.as_deref() {
                         Some("dbt_model") => args.dbt_model = Some(val.value()),
                         Some("dbt_primary_key") => args.dbt_primary_key = Some(val.value()),
@@ -97,6 +91,9 @@ pub fn mimir_type(attr: TokenStream, item: TokenStream) -> TokenStream {
     // add serde aliases for camelCase field names
     add_serde_aliases(&mut input);
 
+    // extract struct-level doc comment for schema metadata
+    let struct_doc = extract_doc_comment(&input.attrs);
+
     // extract fields and build params
     let fields = extract_named_fields(&input);
     let (params, field_names) = build_params_and_field_names(fields);
@@ -108,7 +105,7 @@ pub fn mimir_type(attr: TokenStream, item: TokenStream) -> TokenStream {
     let struct_def = generate_struct_definition(&input, &name);
     let type_behavior = generate_type_behavior_impl(&name);
     let pymethods = generate_pymethods_impl(&name, &field_names, &arrow_fields);
-    let rust_impl = generate_rust_impl(&name, &params, &field_names, &arrow_fields);
+    let rust_impl = generate_rust_impl(&name, &params, &field_names, &arrow_fields, &struct_doc);
     let registration = generate_registration(&name, &stub_fields, &stub_methods, &args);
 
     let expanded = quote! {
@@ -599,7 +596,33 @@ fn generate_stub_fields_info(fields: &Punctuated<Field, Comma>) -> String {
         .join(";")
 }
 
+/// Extract the doc comment from `/// ...` attributes.
+fn extract_doc_comment(attrs: &[syn::Attribute]) -> Option<String> {
+    let doc_lines: Vec<String> = attrs
+        .iter()
+        .filter_map(|attr| {
+            // name value, value is a string literal and attr is doc (ie #[doc = "foo"])
+            if let Meta::NameValue(nv) = &attr.meta
+                && let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(val), .. }) = &nv.value
+                && attr.path().is_ident("doc")
+            {
+                return Some(val.value().trim().to_string());
+            }
+            None
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if doc_lines.is_empty() {
+        None
+    } else {
+        // multiple doc comment lines are joined with spaces after trimming
+        Some(doc_lines.join(" "))
+    }
+}
+
 /// Generate Arrow field construction tokens for a struct's fields.
+/// Doc comments on fields are attached as Arrow field metadata under the "description" key.
 fn generate_arrow_fields(fields: &Punctuated<Field, Comma>) -> Vec<TokenStream2> {
     fields
         .iter()
@@ -607,8 +630,20 @@ fn generate_arrow_fields(fields: &Punctuated<Field, Comma>) -> Vec<TokenStream2>
             f.ident.as_ref().map(|name| {
                 let name_str = strip_raw_prefix(&name.to_string());
                 let (datatype_tokens, nullable) = rust_type_to_arrow_datatype(&f.ty);
-                quote! {
-                    arrow_schema::Field::new(#name_str, #datatype_tokens, #nullable)
+
+                match extract_doc_comment(&f.attrs) {
+                    Some(desc) => quote! {
+                        arrow_schema::Field::new(#name_str, #datatype_tokens, #nullable)
+                            .with_metadata(
+                                std::collections::HashMap::from([
+                                    // place doc/description into description key of metadata
+                                    ("description".to_string(), #desc.to_string())
+                                ])
+                            )
+                    },
+                    None => quote! {
+                        arrow_schema::Field::new(#name_str, #datatype_tokens, #nullable)
+                    },
                 }
             })
         })
@@ -759,16 +794,14 @@ fn common_methods() -> Vec<CommonMethod> {
 
 /// Generate the combined stub methods string from all common methods.
 fn generate_stub_methods() -> String {
-    let common_stubs: Vec<String> = common_methods()
-        .iter()
-        .map(|m| format!("    {}", m.stub))
-        .collect();
+    let common_stubs: Vec<String> = common_methods().iter().map(|m| format!("    {}", m.stub)).collect();
 
     // Add arrow schema and record batch stubs
     let arrow_stubs = vec![
         "    @classmethod\n    def arrow_schema(cls) -> \"pyarrow.Schema\": ...".to_string(),
         "    @classmethod\n    def to_record_batch(cls, items: list[Self]) -> \"pyarrow.RecordBatch\": ...".to_string(),
-        "    @classmethod\n    def from_record_batch(cls, batch: \"pyarrow.RecordBatch\") -> list[Self]: ...".to_string(),
+        "    @classmethod\n    def from_record_batch(cls, batch: \"pyarrow.RecordBatch\") -> list[Self]: ..."
+            .to_string(),
     ];
 
     [common_stubs, arrow_stubs].concat().join("\n")
@@ -788,7 +821,10 @@ fn generate_pymethods_impl(
     // reusing the same path as from_dict. This handles datetime objects with any
     // tzinfo (zoneinfo, timezone.utc, etc.) and nested mimir type instances.
     let init_field_idents: Vec<&Ident> = field_names.iter().map(|n| n.as_ref().unwrap()).collect();
-    let init_field_name_strs: Vec<String> = init_field_idents.iter().map(|id| strip_raw_prefix(&id.to_string())).collect();
+    let init_field_name_strs: Vec<String> = init_field_idents
+        .iter()
+        .map(|id| strip_raw_prefix(&id.to_string()))
+        .collect();
 
     quote! {
         #[cfg(feature = "pyo3")]
@@ -861,7 +897,24 @@ fn generate_rust_impl(
     params: &[TokenStream2],
     field_names: &[&Option<Ident>],
     arrow_fields: &[TokenStream2],
+    struct_doc: &Option<String>,
 ) -> TokenStream2 {
+    let schema_constructor = match struct_doc {
+        Some(desc) => quote! {
+            arrow_schema::Schema::new_with_metadata(
+                vec![#(#arrow_fields),*],
+                std::collections::HashMap::from([
+                    ("description".to_string(), #desc.to_string())
+                ]),
+            )
+        },
+        None => quote! {
+            arrow_schema::Schema::new(vec![
+                #(#arrow_fields),*
+            ])
+        },
+    };
+
     quote! {
         impl #name {
             #[allow(clippy::too_many_arguments)]
@@ -875,9 +928,7 @@ fn generate_rust_impl(
         impl #name {
             /// Get the Arrow schema for this type.
             pub fn get_arrow_schema() -> arrow_schema::Schema {
-                arrow_schema::Schema::new(vec![
-                    #(#arrow_fields),*
-                ])
+                #schema_constructor
             }
         }
     }
