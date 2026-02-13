@@ -104,7 +104,7 @@ pub fn mimir_type(attr: TokenStream, item: TokenStream) -> TokenStream {
     // generate all code blocks
     let struct_def = generate_struct_definition(&input, &name);
     let type_behavior = generate_type_behavior_impl(&name);
-    let pymethods = generate_pymethods_impl(&name, &field_names, &arrow_fields);
+    let pymethods = generate_pymethods_impl(&name, &field_names, &arrow_fields, &args);
     let rust_impl = generate_rust_impl(&name, &params, &field_names, &arrow_fields, &struct_doc);
     let registration = generate_registration(&name, &stub_fields, &stub_methods, &args);
 
@@ -802,6 +802,7 @@ fn generate_stub_methods() -> String {
         "    @classmethod\n    def to_record_batch(cls, items: list[Self]) -> \"pyarrow.RecordBatch\": ...".to_string(),
         "    @classmethod\n    def from_record_batch(cls, batch: \"pyarrow.RecordBatch\") -> list[Self]: ..."
             .to_string(),
+        "    @classmethod\n    def iceberg_table(cls) -> str | None: ...".to_string(),
     ];
 
     [common_stubs, arrow_stubs].concat().join("\n")
@@ -812,6 +813,7 @@ fn generate_pymethods_impl(
     name: &Ident,
     field_names: &[&Option<Ident>],
     _arrow_fields: &[TokenStream2],
+    args: &MimirTypeArgs,
 ) -> TokenStream2 {
     // generate tokens for all common methods
     let method_impls: Vec<TokenStream2> = common_methods().iter().map(|m| (m.impl_tokens)()).collect();
@@ -825,6 +827,35 @@ fn generate_pymethods_impl(
         .iter()
         .map(|id| strip_raw_prefix(&id.to_string()))
         .collect();
+
+    // Generate iceberg_table() classmethod - per-type since it depends on dbt_model value
+    let iceberg_table_impl = match &args.dbt_model {
+        Some(model) => quote! {
+            /// Returns the iceberg table identifier for this type,
+            /// ie "datalake.processed.norce.profiles"
+            #[classmethod]
+            pub fn iceberg_table(
+                _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+            ) -> Option<String> {
+                let module = module_path!();
+                let stripped = module.strip_prefix("mimirtypes::").unwrap_or(module);
+                let namespace = stripped
+                    .rsplit_once("::")
+                    .map(|(ns, _)| ns.replace("::", "."))
+                    .unwrap_or_default();
+                Some(format!("{}.{}", namespace, #model))
+            }
+        },
+        None => quote! {
+            /// Return None, this type does not map to a dbt created iceberg table
+            #[classmethod]
+            pub fn iceberg_table(
+                _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+            ) -> Option<String> {
+                None
+            }
+        },
+    };
 
     quote! {
         #[cfg(feature = "pyo3")]
@@ -887,6 +918,8 @@ fn generate_pymethods_impl(
                 serde_arrow::from_record_batch(&batch.into_inner())
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
             }
+
+            #iceberg_table_impl
         }
     }
 }
