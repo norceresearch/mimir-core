@@ -491,7 +491,9 @@ fn convert_to_arrow_datatype_inner(s: &str, inside_option: bool) -> (TokenStream
         "()" => quote! { arrow_schema::DataType::Null },
         _ => {
             // Handle chrono/jiff datetime types
-            if s.contains("DateTime") || s.contains("Timestamp") || s.contains("Zoned") {
+            if s.contains("NaiveDateTime") {
+                quote! { arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None) }
+            } else if s.contains("DateTime") || s.contains("Timestamp") || s.contains("Zoned") {
                 quote! { arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())) }
             } else if s.contains("NaiveDate") {
                 quote! { arrow_schema::DataType::Date32 }
