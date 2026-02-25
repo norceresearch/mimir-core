@@ -830,11 +830,13 @@ fn generate_pymethods_impl(
         .map(|id| strip_raw_prefix(&id.to_string()))
         .collect();
 
-    // Generate iceberg_table() classmethod - per-type since it depends on dbt_model value
-    let iceberg_table_impl = match &args.dbt_model {
-        Some(model) => quote! {
+    // Generate iceberg_table() classmethod - returns the fully qualified iceberg table
+    // identifier when dbt_model or dbt_source is set, None otherwise.
+    let table_name_literal = args.dbt_model.as_ref().or(args.dbt_source.as_ref());
+    let iceberg_table_impl = match table_name_literal {
+        Some(name) => quote! {
             /// Returns the iceberg table identifier for this type,
-            /// ie "datalake.processed.norce.profiles"
+            /// e.g. "datalake.processed.norce.profiles" or "datalake.raw.cristin.publications"
             #[classmethod]
             pub fn iceberg_table(
                 _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
@@ -845,11 +847,11 @@ fn generate_pymethods_impl(
                     .rsplit_once("::")
                     .map(|(ns, _)| ns.replace("::", "."))
                     .unwrap_or_default();
-                Some(format!("{}.{}", namespace, #model))
+                Some(format!("{}.{}", namespace, #name))
             }
         },
         None => quote! {
-            /// Return None, this type does not map to a dbt created iceberg table
+            /// Return None, this type does not map to an iceberg table
             #[classmethod]
             pub fn iceberg_table(
                 _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
