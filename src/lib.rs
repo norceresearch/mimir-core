@@ -660,7 +660,7 @@ fn generate_arrow_fields(fields: &Punctuated<Field, Comma>) -> Vec<TokenStream2>
 fn generate_struct_definition(input: &DeriveInput, name: &Ident) -> TokenStream2 {
     quote! {
         #[cfg_attr(feature = "pyo3", pyo3::pyclass(get_all))]
-        #[derive(ts_rs::TS, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+        #[derive(ts_rs::TS, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema, typesense::Typesense)]
         #[ts(export, export_to = format!("{}/{}.ts", module_path!().replace("::", "/"), stringify!(#name)))]
         #input
     }
@@ -805,6 +805,7 @@ fn generate_stub_methods() -> String {
         "    @classmethod\n    def from_record_batch(cls, batch: \"pyarrow.RecordBatch\") -> list[Self]: ..."
             .to_string(),
         "    @classmethod\n    def iceberg_table(cls) -> str | None: ...".to_string(),
+        "    @classmethod\n    def typesense_schema(cls) -> dict[str, Any]: ...".to_string(),
     ];
 
     [common_stubs, arrow_stubs].concat().join("\n")
@@ -924,6 +925,16 @@ fn generate_pymethods_impl(
             }
 
             #iceberg_table_impl
+
+            #[classmethod]
+            pub fn typesense_schema<'py>(
+                _cls: &pyo3::Bound<'py, pyo3::types::PyType>,
+                py: pyo3::prelude::Python<'py>,
+            ) -> pyo3::prelude::PyResult<pyo3::prelude::Bound<'py, pyo3::prelude::PyAny>> {
+                let schema = <Self as typesense::prelude::Document>::collection_schema();
+                let dict = pythonize::pythonize(py, &schema)?;
+                Ok(dict)
+            }
         }
     }
 }
