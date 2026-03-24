@@ -659,7 +659,7 @@ fn generate_arrow_fields(fields: &Punctuated<Field, Comma>) -> Vec<TokenStream2>
 /// Generate the struct definition with all necessary derive macros and attributes.
 fn generate_struct_definition(input: &DeriveInput, name: &Ident) -> TokenStream2 {
     quote! {
-        #[cfg_attr(feature = "pyo3", pyo3::pyclass(get_all))]
+        #[cfg_attr(feature = "pyo3", pyo3::pyclass(get_all, from_py_object))]
         #[derive(ts_rs::TS, Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, schemars::JsonSchema, typesense::Typesense)]
         #[ts(export, export_to = format!("{}/{}.ts", module_path!().replace("::", "/"), stringify!(#name)))]
         #input
