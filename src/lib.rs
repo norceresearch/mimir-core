@@ -9,6 +9,17 @@
 //! - Automatic module registration via linkme
 //! - Python stub info for .pyi generation
 //!
+//! ## `#[mimir_enum]`
+//!
+//! Attribute macro for unit-variant enums that generates:
+//! - PyO3 `pyclass` (eq, eq_int, hash, frozen) with `name`, `values`,
+//!   `from_str`, `to_json`/`from_json`, and `__str__`/`__repr__`
+//! - `std::str::FromStr` and `crate::TypeBehavior` impls (for Rust callers)
+//! - Serde serialization as the variant name string
+//! - TypeScript export via ts-rs (string union)
+//! - Arrow mapping to `LargeUtf8` via `crate::MimirArrowType`
+//! - Automatic module registration via linkme
+//!
 //! ## `#[mimir_function]`
 //!
 //! Attribute macro for functions that generates:
@@ -113,6 +124,59 @@ pub fn mimir_type(attr: TokenStream, item: TokenStream) -> TokenStream {
         #type_behavior
         #pymethods
         #rust_impl
+        #registration
+    };
+
+    expanded.into()
+}
+
+// ============================================================================
+// mimir_enum macro
+// ============================================================================
+
+/// Attribute macro that transforms a unit-variant enum into a full mimir enum.
+///
+/// Generates:
+/// - `#[pyclass(eq, eq_int, frozen, hash, from_py_object)]` so each variant
+///   compares equal to itself, behaves as its declaration index in `int(...)`
+///   contexts, is hashable, and immutable.
+/// - `name`/`__str__`/`__repr__`, plus `values()` / `from_str` classmethods
+///   and `to_json`/`from_json` for parity with `enum.Enum`.
+/// - `std::str::FromStr` and `crate::TypeBehavior` impls so Rust callers get
+///   the same parsing/serialization as Python ones.
+/// - Arrow mapping to `LargeUtf8` via `crate::MimirArrowType`.
+/// - A class-level `__mimir_enum__` marker attribute used by
+///   `pyutil::to_serde_compatible` to detect enum instances.
+/// - Automatic registration in `MIMIR_ENUMS` for stub generation and module
+///   building.
+///
+/// Only enums with unit variants (no fields) are supported.
+///
+/// **Use as a field on `#[mimir_type]` (typesense Document):**
+/// `EnumType`, `Option<EnumType>`, `Vec<EnumType>`, `Option<Vec<EnumType>>`,
+/// and `Vec<Option<EnumType>>` all map to typesense `string` / `string[]`
+/// transparently.
+#[proc_macro_attribute]
+pub fn mimir_enum(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as DeriveInput);
+    let name = input.ident.clone();
+    let variants = extract_unit_variants(&input);
+    let variant_strs: Vec<String> = variants.iter().map(|i| i.to_string()).collect();
+    let enum_doc = extract_doc_comment(&input.attrs);
+
+    let enum_def = generate_enum_definition(&input, &name);
+    let type_behavior = generate_type_behavior_impl(&name);
+    let from_str_impl = generate_enum_from_str_impl(&name, &variants, &variant_strs);
+    let pymethods = generate_enum_pymethods(&name, &variants, &variant_strs);
+    let arrow_impl = generate_enum_arrow_impl(&name);
+    let registration = generate_enum_registration(&name, &variant_strs, &enum_doc);
+
+    let expanded = quote! {
+        #enum_def
+        #type_behavior
+        #from_str_impl
+        #pymethods
+        #arrow_impl
         #registration
     };
 
@@ -498,30 +562,23 @@ fn convert_to_arrow_datatype_inner(s: &str, inside_option: bool) -> (TokenStream
             } else if s.contains("NaiveDate") {
                 quote! { arrow_schema::DataType::Date32 }
             } else {
-                // For nested mimir types, call their get_arrow_schema() to build a Struct type
-                // Extract just the type name (without module path)
+                // For nested mimir types, defer to the MimirArrowType trait.
+                // Extract just the type name (without module path).
                 let type_name = s.split("::").last().unwrap_or(s).trim();
                 let type_ident = format_ident!("{}", type_name);
 
-                // When inside an Option, make all nested struct fields nullable
-                // because when the Option is None, all inner fields will be null
+                // When inside an Option, make any nested struct's immediate fields
+                // nullable; see `crate::_struct_fields_nullable` as to why.
+                // Non-struct nested types (enums, etc.) pass through unchanged.
                 if inside_option {
                     quote! {
-                        arrow_schema::DataType::Struct(
-                            arrow_schema::Fields::from(
-                                #type_ident::get_arrow_schema()
-                                    .fields()
-                                    .iter()
-                                    .map(|f| arrow_schema::Field::new(f.name(), f.data_type().clone(), true))
-                                    .collect::<Vec<_>>()
-                            )
+                        crate::_struct_fields_nullable(
+                            <#type_ident as crate::MimirArrowType>::arrow_data_type()
                         )
                     }
                 } else {
                     quote! {
-                        arrow_schema::DataType::Struct(
-                            #type_ident::get_arrow_schema().fields().clone()
-                        )
+                        <#type_ident as crate::MimirArrowType>::arrow_data_type()
                     }
                 }
             }
@@ -724,7 +781,7 @@ fn common_methods() -> Vec<CommonMethod> {
                         }
 
                         let py = obj.py();
-                        let normalized = crate::pyutil::normalize_datetimes(py, obj)?;
+                        let normalized = crate::pyutil::to_serde_compatible(py, obj)?;
 
                         let result: Self = crate::pyutil::depythonize_with_path(&normalized)
                             .map_err(|e| {
@@ -822,9 +879,9 @@ fn generate_pymethods_impl(
     let method_impls: Vec<TokenStream2> = common_methods().iter().map(|m| (m.impl_tokens)()).collect();
 
     // Build __init__ params (all Bound<PyAny>) and dict insertion statements.
-    // __init__ builds a dict and delegates to normalize_datetimes + depythonize,
-    // reusing the same path as from_dict. This handles datetime objects with any
-    // tzinfo (zoneinfo, timezone.utc, etc.) and nested mimir type instances.
+    // __init__ builds a dict and delegates to to_serde_compatible + depythonize,
+    // reusing the same path as from_dict. Handles datetimes with any tzinfo,
+    // mimir_enum instances, and nested mimir type instances.
     let init_field_idents: Vec<&Ident> = field_names.iter().map(|n| n.as_ref().unwrap()).collect();
     let init_field_name_strs: Vec<String> = init_field_idents
         .iter()
@@ -875,7 +932,7 @@ fn generate_pymethods_impl(
                 use pyo3::types::PyDictMethods;
                 let dict = pyo3::types::PyDict::new(py);
                 #(dict.set_item(#init_field_name_strs, &#init_field_idents)?;)*
-                let normalized = crate::pyutil::normalize_datetimes(py, &dict.clone().into_any())?;
+                let normalized = crate::pyutil::to_serde_compatible(py, &dict.clone().into_any())?;
                 crate::pyutil::depythonize_with_path(&normalized)
                     .map_err(|e| {
                         pyo3::exceptions::PyValueError::new_err(format!(
@@ -979,6 +1036,12 @@ fn generate_rust_impl(
                 #schema_constructor
             }
         }
+
+        impl crate::MimirArrowType for #name {
+            fn arrow_data_type() -> arrow_schema::DataType {
+                arrow_schema::DataType::Struct(Self::get_arrow_schema().fields().clone())
+            }
+        }
     }
 }
 
@@ -1013,6 +1076,174 @@ fn generate_registration(name: &Ident, stub_fields: &str, stub_methods: &str, ar
             dbt_primary_key: #dbt_primary_key_tokens,
             dbt_source: #dbt_source_tokens,
             get_schema: <#name>::get_arrow_schema,
+            register: |m: &pyo3::Bound<'_, pyo3::types::PyModule>| -> pyo3::PyResult<()> {
+                use pyo3::types::PyModuleMethods;
+                m.add_class::<#name>()
+            },
+        };
+    }
+}
+
+// ============================================================================
+// mimir_enum code generation
+// ============================================================================
+
+/// Validate that the input is an enum with only unit variants and return the
+/// variant identifiers in declaration order.
+fn extract_unit_variants(input: &DeriveInput) -> Vec<&Ident> {
+    let variants = match &input.data {
+        Data::Enum(data) => &data.variants,
+        _ => panic!("mimir_enum only supports enums"),
+    };
+    variants
+        .iter()
+        .map(|v| match &v.fields {
+            Fields::Unit => &v.ident,
+            _ => panic!(
+                "mimir_enum only supports unit variants (no fields), but variant `{}` has fields",
+                v.ident
+            ),
+        })
+        .collect()
+}
+
+/// Generate the enum definition with derives, pyclass, and ts-rs export.
+fn generate_enum_definition(input: &DeriveInput, name: &Ident) -> TokenStream2 {
+    quote! {
+        #[cfg_attr(feature = "pyo3", pyo3::pyclass(eq, eq_int, frozen, hash, from_py_object))]
+        #[derive(ts_rs::TS, Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+        #[ts(export, export_to = format!("{}/{}.ts", module_path!().replace("::", "/"), stringify!(#name)))]
+        #input
+    }
+}
+
+/// Generate `impl std::str::FromStr` for the enum so Rust callers parse with
+/// `EnumName::from_str("Variant")` and the pyo3 classmethod has a single
+/// source of truth to delegate to.
+fn generate_enum_from_str_impl(name: &Ident, variants: &[&Ident], variant_strs: &[String]) -> TokenStream2 {
+    quote! {
+        impl std::str::FromStr for #name {
+            type Err = String;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    #(#variant_strs => Ok(Self::#variants),)*
+                    other => Err(format!("Unknown {} variant: {}", stringify!(#name), other)),
+                }
+            }
+        }
+    }
+}
+
+/// Generate the `#[pymethods]` block exposed to Python callers.
+fn generate_enum_pymethods(name: &Ident, variants: &[&Ident], variant_strs: &[String]) -> TokenStream2 {
+    quote! {
+        #[cfg(feature = "pyo3")]
+        #[pyo3::pymethods]
+        impl #name {
+            /// Marker attribute consumed by `mimirtypes::pyutil::to_serde_compatible`
+            /// to detect enum instances without scanning the global registry.
+            #[classattr]
+            #[allow(non_upper_case_globals)]
+            const __mimir_enum__: bool = true;
+
+            /// Variant name (e.g. "Active").
+            #[getter]
+            pub fn name(&self) -> &'static str {
+                match self {
+                    #(Self::#variants => #variant_strs,)*
+                }
+            }
+
+            pub fn __str__(&self) -> String {
+                self.name().to_string()
+            }
+
+            pub fn __repr__(&self) -> String {
+                format!("{}.{}", stringify!(#name), self.name())
+            }
+
+            /// All variants in declaration order.
+            #[classmethod]
+            pub fn values(_cls: &pyo3::Bound<'_, pyo3::types::PyType>) -> Vec<Self> {
+                vec![#(Self::#variants),*]
+            }
+
+            /// Look up a variant by name. Raises `ValueError` if unknown.
+            ///
+            /// Renamed in Python to `from_str` so Python callers get the
+            /// idiomatic name; the Rust name is `py_from_str` to avoid
+            /// shadowing `<Self as std::str::FromStr>::from_str` for Rust
+            /// callers.
+            #[classmethod]
+            #[pyo3(name = "from_str")]
+            pub fn py_from_str(
+                _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+                s: &str,
+            ) -> pyo3::PyResult<Self> {
+                <Self as std::str::FromStr>::from_str(s)
+                    .map_err(pyo3::exceptions::PyValueError::new_err)
+            }
+
+            /// Serialize the variant as a JSON string (e.g. `"Active"`).
+            pub fn to_json(&self) -> pyo3::PyResult<String> {
+                <Self as crate::TypeBehavior>::to_json(self)
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            }
+
+            /// Parse a JSON string into a variant.
+            #[classmethod]
+            pub fn from_json(
+                _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
+                json: &str,
+            ) -> pyo3::PyResult<Self> {
+                <Self as crate::TypeBehavior>::from_json(json.to_owned())
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+            }
+        }
+    }
+}
+
+/// Generate Arrow + typesense impls. Enums map to `LargeUtf8` so they go
+/// in wherever a string column would.
+fn generate_enum_arrow_impl(name: &Ident) -> TokenStream2 {
+    quote! {
+        impl crate::MimirArrowType for #name {
+            fn arrow_data_type() -> arrow_schema::DataType {
+                arrow_schema::DataType::LargeUtf8
+            }
+        }
+
+        // Map the enum to a typesense `string` field. `Option<Self>` works
+        // automatically via typesense's blanket `impl<T: ToTypesenseField> for Option<T>`.
+        // `Vec<Self>` cannot be impl'd here (orphan rules forbid implementing a
+        // foreign trait for `Vec<LocalType>`)
+        impl typesense::prelude::ToTypesenseField for #name {
+            #[inline(always)]
+            fn to_typesense_type() -> &'static str {
+                "string"
+            }
+        }
+    }
+}
+
+/// Generate the linkme registration entry for stub generation and PyO3 module
+/// building.
+fn generate_enum_registration(name: &Ident, variant_strs: &[String], doc: &Option<String>) -> TokenStream2 {
+    let registration_ident = format_ident!("__MIMIR_ENUM_REG_{}", name);
+    let description_tokens = match doc {
+        Some(d) => quote! { Some(#d) },
+        None => quote! { None },
+    };
+    quote! {
+        #[cfg(feature = "pyo3")]
+        #[allow(non_upper_case_globals)]
+        #[linkme::distributed_slice(crate::MIMIR_ENUMS)]
+        #[linkme(crate = linkme)]
+        static #registration_ident: crate::MimirEnumEntry = crate::MimirEnumEntry {
+            rust_module_path: module_path!(),
+            type_name: stringify!(#name),
+            variants: &[#(#variant_strs),*],
+            description: #description_tokens,
             register: |m: &pyo3::Bound<'_, pyo3::types::PyModule>| -> pyo3::PyResult<()> {
                 use pyo3::types::PyModuleMethods;
                 m.add_class::<#name>()
