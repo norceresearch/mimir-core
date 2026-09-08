@@ -384,6 +384,17 @@ fn rust_type_to_python_hint(ty: &Type) -> String {
 fn convert_type_string(s: &str) -> String {
     let s = s.trim();
 
+    // PyResult<T> / Result<T, E> -> T. Python callers never see the error type;
+    // pyo3 raises it as an exception.
+    if let Some(open) = s.find('<') {
+        let head = s[..open].trim().rsplit("::").next().unwrap_or_default().trim();
+        if head == "PyResult" || head == "Result" {
+            let inner = extract_generic_arg(s, head);
+            let args = split_generic_args(&inner);
+            return convert_type_string(args.first().copied().unwrap_or(inner.as_str()));
+        }
+    }
+
     // Option<T> -> T | None
     if s.starts_with("Option <") || s.starts_with("Option<") {
         let inner = extract_generic_arg(s, "Option");
