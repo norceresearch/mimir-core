@@ -109,6 +109,7 @@ pub fn mimir_type(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fields = extract_named_fields(&input);
     let (params, field_names) = build_params_and_field_names(fields);
     let stub_fields = generate_stub_fields_info(fields);
+    let field_type_paths = generate_field_type_paths(fields);
     let stub_methods = generate_stub_methods();
     let arrow_fields = generate_arrow_fields(fields);
 
@@ -117,7 +118,7 @@ pub fn mimir_type(attr: TokenStream, item: TokenStream) -> TokenStream {
     let type_behavior = generate_type_behavior_impl(&name);
     let pymethods = generate_pymethods_impl(&name, &field_names, &arrow_fields, &args);
     let rust_impl = generate_rust_impl(&name, &params, &field_names, &arrow_fields, &struct_doc);
-    let registration = generate_registration(&name, &stub_fields, &stub_methods, &args);
+    let registration = generate_registration(&name, &stub_fields, &field_type_paths, &stub_methods, &args);
 
     let expanded = quote! {
         #struct_def
@@ -655,6 +656,21 @@ fn generate_stub_fields_info(fields: &Punctuated<Field, Comma>) -> String {
         .join(";")
 }
 
+/// Build a fn returning the fully-qualified Rust type path of every field.
+///
+/// A proc macro sees a field type only as written (`Person`), never the module
+/// it resolves to, so stub generation cannot tell two same-named types apart.
+/// `std::any::type_name` is evaluated in the defining module's scope, which is
+/// the one place the real path is knowable.
+fn generate_field_type_paths(fields: &Punctuated<Field, Comma>) -> TokenStream2 {
+    let paths = fields.iter().filter(|f| f.ident.is_some()).map(|f| {
+        let ty = &f.ty;
+        quote! { std::any::type_name::<#ty>() }
+    });
+
+    quote! { || vec![#(#paths),*] }
+}
+
 /// Extract the doc comment from `/// ...` attributes.
 fn extract_doc_comment(attrs: &[syn::Attribute]) -> Option<String> {
     let doc_lines: Vec<String> = attrs
@@ -1046,7 +1062,13 @@ fn generate_rust_impl(
 }
 
 /// Generate the linkme registration for automatic PyO3 module building.
-fn generate_registration(name: &Ident, stub_fields: &str, stub_methods: &str, args: &MimirTypeArgs) -> TokenStream2 {
+fn generate_registration(
+    name: &Ident,
+    stub_fields: &str,
+    field_type_paths: &TokenStream2,
+    stub_methods: &str,
+    args: &MimirTypeArgs,
+) -> TokenStream2 {
     let registration_ident = format_ident!("__MIMIR_TYPE_REG_{}", name);
 
     let dbt_model_tokens = match &args.dbt_model {
@@ -1071,6 +1093,7 @@ fn generate_registration(name: &Ident, stub_fields: &str, stub_methods: &str, ar
             rust_module_path: module_path!(),
             type_name: stringify!(#name),
             stub_fields: #stub_fields,
+            field_type_paths: #field_type_paths,
             stub_methods: #stub_methods,
             dbt_model: #dbt_model_tokens,
             dbt_primary_key: #dbt_primary_key_tokens,
