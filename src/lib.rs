@@ -932,7 +932,10 @@ fn generate_pymethods_impl(
                     .rsplit_once("::")
                     .map(|(ns, _)| ns.replace("::", "."))
                     .unwrap_or_default();
-                Some(format!("{}.{}", namespace, #name))
+                // A dotted dbt model such as "api.projects" is written under its
+                // alias, the last segment, so the prefix must not land in the id.
+                let table = #name.rsplit('.').next().unwrap_or(#name);
+                Some(format!("{}.{}", namespace, table))
             }
         },
         None => quote! {
