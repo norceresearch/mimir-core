@@ -42,11 +42,15 @@ use syn::{
 // Attribute parsing
 // ============================================================================
 
-/// Parsed arguments from `#[mimir_type(dbt_model = "name", dbt_source = "table")]`
+/// Parsed arguments from
+/// `#[mimir_type(dbt_model = "name", dbt_source = "table", fetched_from = "/path/{id}")]`
 struct MimirTypeArgs {
     dbt_model: Option<String>,
     dbt_primary_key: Option<String>,
     dbt_source: Option<String>,
+    /// Upstream endpoint a raw type is read from, so a consumer serving data
+    /// derived from it can check a caller may read the same thing at the origin.
+    fetched_from: Option<String>,
 }
 
 impl MimirTypeArgs {
@@ -55,6 +59,7 @@ impl MimirTypeArgs {
             dbt_model: None,
             dbt_primary_key: None,
             dbt_source: None,
+            fetched_from: None,
         };
 
         if attr.is_empty() {
@@ -72,6 +77,7 @@ impl MimirTypeArgs {
                         Some("dbt_model") => args.dbt_model = Some(val.value()),
                         Some("dbt_primary_key") => args.dbt_primary_key = Some(val.value()),
                         Some("dbt_source") => args.dbt_source = Some(val.value()),
+                        Some("fetched_from") => args.fetched_from = Some(val.value()),
                         Some(other) => panic!("Unknown mimir_type attribute: {other}"),
                         None => {}
                     }
@@ -1097,6 +1103,10 @@ fn generate_registration(
         Some(source) => quote! { Some(#source) },
         None => quote! { None },
     };
+    let fetched_from_tokens = match &args.fetched_from {
+        Some(path) => quote! { Some(#path) },
+        None => quote! { None },
+    };
 
     quote! {
         #[cfg(feature = "pyo3")]
@@ -1112,6 +1122,7 @@ fn generate_registration(
             dbt_model: #dbt_model_tokens,
             dbt_primary_key: #dbt_primary_key_tokens,
             dbt_source: #dbt_source_tokens,
+            fetched_from: #fetched_from_tokens,
             get_schema: <#name>::get_arrow_schema,
             register: |m: &pyo3::Bound<'_, pyo3::types::PyModule>| -> pyo3::PyResult<()> {
                 use pyo3::types::PyModuleMethods;
