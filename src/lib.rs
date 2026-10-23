@@ -108,6 +108,14 @@ pub fn mimir_type(attr: TokenStream, item: TokenStream) -> TokenStream {
     // add serde aliases for camelCase field names
     add_serde_aliases(&mut input);
 
+    // Document the origin once, from the declaration: rustdoc, ts-rs, the Python
+    // stubs and the dbt descriptions all read the struct's doc attributes.
+    if let Some(url) = &args.fetched_from {
+        let line = format!(" Fetched from <{url}>");
+        input.attrs.push(syn::parse_quote!(#[doc = ""]));
+        input.attrs.push(syn::parse_quote!(#[doc = #line]));
+    }
+
     // extract struct-level doc comment for schema metadata
     let struct_doc = extract_doc_comment(&input.attrs);
 
