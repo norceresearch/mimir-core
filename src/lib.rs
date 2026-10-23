@@ -895,6 +895,7 @@ fn generate_stub_methods() -> String {
         "    @classmethod\n    def from_record_batch(cls, batch: \"pyarrow.RecordBatch\") -> list[Self]: ..."
             .to_string(),
         "    @classmethod\n    def iceberg_table(cls) -> str | None: ...".to_string(),
+        "    @classmethod\n    def fetched_from(cls) -> str | None: ...".to_string(),
         "    @classmethod\n    def typesense_schema(cls) -> dict[str, Any]: ...".to_string(),
     ];
 
@@ -950,6 +951,23 @@ fn generate_pymethods_impl(
             pub fn iceberg_table(
                 _cls: &pyo3::Bound<'_, pyo3::types::PyType>,
             ) -> Option<String> {
+                None
+            }
+        },
+    };
+
+    let fetched_from_impl = match &args.fetched_from {
+        Some(path) => quote! {
+            /// Upstream endpoint this raw type is read from, relative to the vendor API root
+            #[classmethod]
+            pub fn fetched_from(_cls: &pyo3::Bound<'_, pyo3::types::PyType>) -> Option<String> {
+                Some(#path.to_string())
+            }
+        },
+        None => quote! {
+            /// Return None, this type declares no upstream endpoint
+            #[classmethod]
+            pub fn fetched_from(_cls: &pyo3::Bound<'_, pyo3::types::PyType>) -> Option<String> {
                 None
             }
         },
@@ -1018,6 +1036,8 @@ fn generate_pymethods_impl(
             }
 
             #iceberg_table_impl
+
+            #fetched_from_impl
 
             #[classmethod]
             pub fn typesense_schema<'py>(
